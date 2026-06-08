@@ -4,19 +4,65 @@ use memmap2::Mmap;
 use skrifa::charmap::Charmap;
 use skrifa::instance::Location;
 use skrifa::metrics::GlyphMetrics;
-use skrifa::outline::{HintingInstance};
+use skrifa::outline::{DrawSettings, HintingInstance, OutlinePen};
 use skrifa::prelude::{LocationRef, Size};
 use skrifa::raw::{FileRef};
-use skrifa::{GlyphId};
+use skrifa::{GlyphId, MetadataProvider as _};
+use vello_cpu::kurbo::{BezPath, Shape as _};
 use vello_cpu::peniko::{self, Blob};
-use vello_cpu::{Level, PaintType, Pixmap, RenderContext, RenderMode, RenderSettings};
+use vello_cpu::{Level, PaintType, RenderContext, RenderMode, RenderSettings, Resources};
 
 use crate::{
     FastHashMap, FontInstance, GlyphFormat, GlyphKey, GlyphRasterError, GlyphRasterResult,
     RasterizedGlyph,
 };
 
-type PenikoFont = vello_cpu::peniko::Font;
+type PenikoFont = vello_cpu::peniko::FontData;
+
+#[derive(Clone, Default)]
+pub(crate) struct OutlinePath {
+    pub(crate) path: BezPath,
+}
+
+impl OutlinePath {
+    pub(crate) fn new() -> Self {
+        Self {
+            path: BezPath::new(),
+        }
+    }
+
+    pub(crate) fn reuse(&mut self) {
+        self.path.truncate(0);
+    }
+}
+
+// Note that we flip the y-axis to match our coordinate system.
+impl OutlinePen for OutlinePath {
+    #[inline]
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.path.move_to((x, y));
+    }
+
+    #[inline]
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.path.line_to((x, y));
+    }
+
+    #[inline]
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.path.curve_to((cx0, cy0), (cx1, cy1), (x, y));
+    }
+
+    #[inline]
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.path.quad_to((cx, cy), (x, y));
+    }
+
+    #[inline]
+    fn close(&mut self) {
+        self.path.close_path();
+    }
+}
 
 // struct CachedFont {
 //     pub data: Arc<dyn AsRef<[u8]> + Send + Sync>,
@@ -192,38 +238,52 @@ impl FontContext {
 
         let glyph_metrics = GlyphMetrics::new(&font_ref, Size::new(font_size), location_ref);
         let advance = glyph_metrics.advance_width(GlyphId::new(key.index()))?;
-        let bounds = glyph_metrics.bounds(GlyphId::new(key.index()))?;
+        // let bounds = glyph_metrics.bounds(GlyphId::new(key.index()))?;
 
-        dbg!(font_size);
-        dbg!(bounds);
-        dbg!(x_scale, y_scale);
-        dbg!(font_instance.flags);
+        let outlines = font_ref.outline_glyphs();
+        let glyph_outline = outlines.get(GlyphId::new(key.index()))?;
+
+        let draw_settings = if let Some(hinting_instance) = None {
+            DrawSettings::hinted(hinting_instance, false)
+        } else {
+            DrawSettings::unhinted(Size::new(font_size), location_ref)
+        };
+
+        let mut outline_path = OutlinePath::new();
+        glyph_outline.draw(draw_settings, &mut outline_path).ok()?;
+
+        let bounds = outline_path.path.bounding_box();
+
+        // dbg!(font_size);
+        // dbg!(bounds);
+        // dbg!(x_scale, y_scale);
+        // dbg!(font_instance.flags);
 
         // Floor/ceil round outward from the fractional bounding box. Width gets an
         // extra pixel to accommodate the horizontal subpixel offset (up to 0.75 px)
         // applied when rasterising into the atlas; the Y axis has no subpixel shift
         // so floor/ceil alone is sufficient. GLYPH_PADDING in the atlas allocator
         // provides the guard band needed by the hybrid renderer's Extend::Pad sampling.
-        let min_x = bounds.x_min.floor() as i32;
-        let max_x = bounds.x_max.ceil() as i32 + 1;
+        let min_x = bounds.x0.floor() as i32;
+        let max_x = bounds.x1.ceil() as i32 + 1;
 
         // For Y, we flip the coordinate system: font Y up -> screen Y down
         // After flipping Y, min_y becomes -max_y and max_y becomes -min_y
-        let flipped_min_y = (-bounds.y_max).floor() as i32;
-        let flipped_max_y = (-bounds.y_min).ceil() as i32;
+        let flipped_min_y = (bounds.y0).floor() as i32;
+        let flipped_max_y = (bounds.y1).ceil() as i32;
 
-        let width = (max_x - min_x) as u16;
-        let height = (flipped_max_y - flipped_min_y) as u16;
+        let width = (max_x + min_x.abs()) as i32;
+        let height = (flipped_max_y + flipped_min_y.abs()) as i32;
 
-        Some(GlyphDimensions {
+        Some(dbg!(GlyphDimensions {
             advance,
 
             // TODO: use hinted metrics
-            left: min_x as i32,
-            top: flipped_min_y as i32,
-            width: width as i32,
-            height: height as i32,
-        })
+            left: 0, //min_x as i32,
+            top: flipped_max_y,  //flipped_min_y as i32,
+            width,
+            height,
+        }))
     }
     pub fn rasterize_glyph(
         &mut self,
@@ -268,6 +328,7 @@ impl FontContext {
             level: Level::new(),
         };
         let mut render_context = RenderContext::new_with(width, height, render_settings);
+        let mut resources = Resources::new();
         let color = peniko::Color::from_rgba8(
             font_instance.color.r,
             font_instance.color.g,
@@ -285,7 +346,7 @@ impl FontContext {
         let font_size = font_size * scale;
 
         render_context
-            .glyph_run(&font)
+            .glyph_run(&mut resources, &font)
             .font_size(font_size)
             .hint(true)
             .fill_glyphs(std::iter::once(vello_cpu::Glyph {
@@ -296,7 +357,13 @@ impl FontContext {
         render_context.flush();
 
         let mut buffer = vec![0; width as usize * height as usize * 4];
-        render_context.render_to_buffer(&mut buffer, width, height, RenderMode::OptimizeSpeed);
+        render_context.render_to_buffer(
+            &mut resources,
+            &mut buffer,
+            width,
+            height,
+            RenderMode::OptimizeSpeed,
+        );
 
         // DEBUG: Write out PNG file of glyphs to $CWD/glyphs/glyph_id.png
         //
