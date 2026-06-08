@@ -199,15 +199,30 @@ impl FontContext {
         dbg!(x_scale, y_scale);
         dbg!(font_instance.flags);
 
+        // Floor/ceil round outward from the fractional bounding box. Width gets an
+        // extra pixel to accommodate the horizontal subpixel offset (up to 0.75 px)
+        // applied when rasterising into the atlas; the Y axis has no subpixel shift
+        // so floor/ceil alone is sufficient. GLYPH_PADDING in the atlas allocator
+        // provides the guard band needed by the hybrid renderer's Extend::Pad sampling.
+        let min_x = bounds.x_min.floor() as i32;
+        let max_x = bounds.x_max.ceil() as i32 + 1;
+
+        // For Y, we flip the coordinate system: font Y up -> screen Y down
+        // After flipping Y, min_y becomes -max_y and max_y becomes -min_y
+        let flipped_min_y = (-bounds.y_max).floor() as i32;
+        let flipped_max_y = (-bounds.y_min).ceil() as i32;
+
+        let width = (max_x - min_x) as u16;
+        let height = (flipped_max_y - flipped_min_y) as u16;
+
         Some(GlyphDimensions {
             advance,
 
-            // TODO: investigate why Skrifa provides f32 but WebRender expects i32
             // TODO: use hinted metrics
-            left: bounds.x_min.floor() as i32,
-            top: bounds.y_max.ceil() as i32,
-            width: (bounds.x_max - bounds.x_min).ceil() as i32,
-            height: (bounds.y_max - bounds.y_min).ceil() as i32,
+            left: min_x as i32,
+            top: flipped_min_y as i32,
+            width: width as i32,
+            height: height as i32,
         })
     }
     pub fn rasterize_glyph(
@@ -313,7 +328,7 @@ fn ttc_index_from_postscript_name(font_file: FileRef<'_>, postscript_name: &str)
     let index = match font_file {
         FileRef::Font(_) => 0,
         FileRef::Collection(collection) => 'idx: {
-            for i in 0 .. collection.len() {
+            for i in 0..collection.len() {
                 let font = collection.get(i).unwrap();
                 let name_table = font.name().unwrap();
                 if name_table
