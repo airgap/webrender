@@ -305,6 +305,11 @@ pub struct FontInstanceOptions {
     // ParamTraits_TiedFields.
     // The sizeof(T) must be equal to the sum of the sizeof each field in T.
     pub _padding: u8,
+    /// When non-zero, glyphs are rasterized as the outline of a stroke of this
+    /// width, in 1/64ths of a layout pixel, centred on the glyph outline. This
+    /// is how `-webkit-text-stroke` is painted:
+    /// <https://compat.spec.whatwg.org/#the-webkit-text-stroke-width>
+    pub stroke_width: u32,
 }
 
 impl Default for FontInstanceOptions {
@@ -314,6 +319,7 @@ impl Default for FontInstanceOptions {
             flags: Default::default(),
             synthetic_italics: SyntheticItalics::disabled(),
             _padding: 0,
+            stroke_width: 0,
         }
     }
 }
